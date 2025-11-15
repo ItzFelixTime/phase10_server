@@ -55,6 +55,15 @@ wss.on("connection", (ws) => {
       broadcast({ type: "players", players });
     }
 
+    // Chat
+if (msg.type === "chat") {
+  broadcast({
+    type: "chat",
+    id,
+    text: msg.text
+  });
+}
+
     // Phase geändert
     if (msg.type === "setPhase") {
       players[id].phase = msg.value;
