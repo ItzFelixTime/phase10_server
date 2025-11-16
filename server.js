@@ -1,103 +1,283 @@
+// server.js
 import { WebSocketServer } from "ws";
 
-// Spieler-Datenbank
-let players = {}; // id -> {name, phase, score}
-let nextPlayerId = 1;
-
-// WebSocket-Server starten
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port: PORT });
 
 console.log("WebSocket Server läuft auf Port", PORT);
 
-// Nachricht an alle Spieler senden
-function broadcast(msg) {
+let nextPlayerId = 1;
+
+// rooms[roomId] = { hostId, started, players: { playerId: {id,name,avatar,phase,score,ws} } }
+const rooms = {};
+// socketInfo: ws -> { roomId, playerId }
+const socketInfo = new Map();
+
+function generateRoomId() {
+  let id;
+  do {
+    id = Math.floor(10000 + Math.random() * 90000).toString(); // 5-stellig
+  } while (rooms[id]);
+  return id;
+}
+
+function publicPlayers(room) {
+  const out = {};
+  for (const [id, p] of Object.entries(room.players)) {
+    out[id] = {
+      name: p.name,
+      avatar: p.avatar,
+      phase: p.phase,
+      score: p.score,
+    };
+  }
+  return out;
+}
+
+function broadcastRoom(roomId, msg) {
+  const room = rooms[roomId];
+  if (!room) return;
   const data = JSON.stringify(msg);
-  for (const client of wss.clients) {
-    if (client.readyState === 1) {
-      client.send(data);
+  for (const p of Object.values(room.players)) {
+    if (p.ws && p.ws.readyState === 1) {
+      p.ws.send(data);
     }
   }
 }
 
-// Verbindung hergestellt
 wss.on("connection", (ws) => {
-  const id = "p" + nextPlayerId++;
-  players[id] = {
-    name: "Spieler",
-    phase: 1,
-    score: 0,
-  };
+  console.log("Client connected");
 
-  console.log("Spieler beigetreten:", id);
-
-  // Initiale Begrüßung + gesamte Spielerliste
-  ws.send(
-    JSON.stringify({
-      type: "welcome",
-      id,
-      players,
-    })
-  );
-
-  // Nachrichten vom Client
   ws.on("message", (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw);
-    } catch (e) {
+    } catch {
       return;
     }
 
-    // Name geändert
+    // ---------- Raum erstellen ----------
+    if (msg.type === "createRoom") {
+      if (socketInfo.has(ws)) return; // schon in einem Raum
+
+      const name = (msg.name || "Spieler").toString().slice(0, 32);
+      const avatar = (msg.avatar || "😄").toString().slice(0, 4);
+
+      const roomId = generateRoomId();
+      const playerId = "p" + nextPlayerId++;
+
+      const room = {
+        hostId: playerId,
+        started: false,
+        players: {},
+      };
+      rooms[roomId] = room;
+
+      room.players[playerId] = {
+        id: playerId,
+        name,
+        avatar,
+        phase: 1,
+        score: 0,
+        ws,
+      };
+
+      socketInfo.set(ws, { roomId, playerId });
+      console.log(`Room ${roomId} erstellt von ${playerId}`);
+
+      ws.send(
+        JSON.stringify({
+          type: "roomCreated",
+          roomId,
+          playerId,
+          hostId: room.hostId,
+          players: publicPlayers(room),
+        })
+      );
+
+      broadcastRoom(roomId, {
+        type: "players",
+        hostId: room.hostId,
+        players: publicPlayers(room),
+      });
+
+      return;
+    }
+
+    // ---------- Raum beitreten ----------
+    if (msg.type === "joinRoom") {
+      if (socketInfo.has(ws)) return;
+
+      const roomId = (msg.roomId || "").toString().trim();
+      const room = rooms[roomId];
+      if (!room) {
+        ws.send(
+          JSON.stringify({
+            type: "roomError",
+            message: "Raum nicht gefunden.",
+          })
+        );
+        return;
+      }
+      if (room.started) {
+        ws.send(
+          JSON.stringify({
+            type: "roomError",
+            message: "In diesem Raum läuft bereits ein Spiel.",
+          })
+        );
+        return;
+      }
+
+      const name = (msg.name || "Spieler").toString().slice(0, 32);
+      const avatar = (msg.avatar || "😄").toString().slice(0, 4);
+      const playerId = "p" + nextPlayerId++;
+
+      room.players[playerId] = {
+        id: playerId,
+        name,
+        avatar,
+        phase: 1,
+        score: 0,
+        ws,
+      };
+      socketInfo.set(ws, { roomId, playerId });
+
+      console.log(`Player ${playerId} joined room ${roomId}`);
+
+      ws.send(
+        JSON.stringify({
+          type: "roomJoined",
+          roomId,
+          playerId,
+          hostId: room.hostId,
+          players: publicPlayers(room),
+        })
+      );
+
+      broadcastRoom(roomId, {
+        type: "players",
+        hostId: room.hostId,
+        players: publicPlayers(room),
+      });
+      return;
+    }
+
+    // Ab hier: Aktionen, die eine Mitgliedschaft voraussetzen
+    const info = socketInfo.get(ws);
+    if (!info) return;
+    const room = rooms[info.roomId];
+    if (!room) return;
+    const player = room.players[info.playerId];
+    if (!player) return;
+
+    // ---------- Name ändern ----------
     if (msg.type === "setName") {
-      players[id].name = msg.value;
-      broadcast({ type: "players", players });
+      player.name = (msg.value || "Spieler").toString().slice(0, 32);
+      broadcastRoom(info.roomId, {
+        type: "players",
+        hostId: room.hostId,
+        players: publicPlayers(room),
+      });
+      return;
     }
 
-    // Chat
-if (msg.type === "chat") {
-  broadcast({
-    type: "chat",
-    id,
-    text: msg.text
-  });
-}
-
-    // Phase geändert
+    // ---------- Phase ändern ----------
     if (msg.type === "setPhase") {
-      players[id].phase = msg.value;
-      broadcast({ type: "players", players });
+      const v = Number(msg.value) || 1;
+      player.phase = Math.max(1, Math.min(10, v));
+      broadcastRoom(info.roomId, {
+        type: "players",
+        hostId: room.hostId,
+        players: publicPlayers(room),
+      });
+      return;
     }
 
-    // Jemand hat seine Phase beendet → neue Runde
+    // ---------- Spiel starten (nur Host) ----------
+    if (msg.type === "startGame") {
+      if (room.hostId !== info.playerId) return;
+      room.started = true;
+      broadcastRoom(info.roomId, { type: "roomStart" });
+      broadcastRoom(info.roomId, {
+        type: "players",
+        hostId: room.hostId,
+        players: publicPlayers(room),
+      });
+      return;
+    }
+
+    // ---------- Phase beendet ----------
     if (msg.type === "phaseDone") {
-      broadcast({
+      broadcastRoom(info.roomId, {
         type: "roundStart",
-        finisher: id,
-        name: players[id].name,
+        finisher: info.playerId,
+        name: player.name,
       });
+      return;
     }
 
-    // Punkte eines Spielers nach der Runde
+    // ---------- Punkte abgeben ----------
     if (msg.type === "scoreSubmit") {
-      players[id].score += msg.points;
-
-      broadcast({
+      const pts = Number(msg.points) || 0;
+      player.score += pts;
+      broadcastRoom(info.roomId, {
         type: "scoreUpdate",
-        id,
-        points: msg.points,
-        total: players[id].score,
+        id: info.playerId,
+        points: pts,
+        total: player.score,
       });
+      broadcastRoom(info.roomId, {
+        type: "players",
+        hostId: room.hostId,
+        players: publicPlayers(room),
+      });
+      return;
+    }
 
-      broadcast({ type: "players", players });
+    // ---------- Chat ----------
+    if (msg.type === "chat") {
+      const text = (msg.text || "").toString().slice(0, 300);
+      if (!text) return;
+      broadcastRoom(info.roomId, {
+        type: "chat",
+        id: info.playerId,
+        text,
+      });
+      return;
     }
   });
 
-  // Verbindung getrennt
   ws.on("close", () => {
-    console.log("Spieler verlassen:", id);
-    delete players[id];
-    broadcast({ type: "players", players });
+    const info = socketInfo.get(ws);
+    if (!info) return;
+
+    const { roomId, playerId } = info;
+    socketInfo.delete(ws);
+    const room = rooms[roomId];
+    if (!room) return;
+
+    delete room.players[playerId];
+    console.log(`Player ${playerId} left room ${roomId}`);
+
+    const remaining = Object.keys(room.players).length;
+    if (remaining === 0) {
+      delete rooms[roomId];
+      console.log(`Room ${roomId} deleted (leer).`);
+      return;
+    }
+
+    if (room.hostId === playerId) {
+      room.hostId = Object.keys(room.players)[0]; // ersten Spieler zum Host machen
+      console.log(`Room ${roomId}: Host gewechselt zu ${room.hostId}`);
+    }
+
+    broadcastRoom(roomId, {
+      type: "players",
+      hostId: room.hostId,
+      players: publicPlayers(room),
+    });
   });
 });
+
+console.log("Ready.");
