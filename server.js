@@ -1,263 +1,248 @@
-// server.js
 import { WebSocketServer } from "ws";
+import OpenAI from "openai";
 
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocketServer({ port: PORT });
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
-console.log("WebSocket Server läuft auf Port", PORT);
+// ==== Datenstrukturen ====
 
-let nextPlayerId = 1;
+let rooms = {}; 
+// rooms[roomId] = { hostId, players: { id: {...} } }
 
-// rooms[roomId] = { hostId, started, players: { playerId: {...} } }
-const rooms = {};
-// socketInfo: ws -> { roomId, playerId }
-const socketInfo = new Map();
+let connections = {}; 
+// connections[id] = ws
 
-function generateRoomId(){
-  let id;
-  do{
-    id = Math.floor(10000 + Math.random()*90000).toString();
-  }while(rooms[id]);
-  return id;
+function makeRoomCode() {
+  return String(Math.floor(10000 + Math.random() * 90000));
 }
 
-function publicPlayers(room){
-  const out = {};
-  for(const [id,p] of Object.entries(room.players)){
-    out[id] = {
-      name: p.name,
-      avatar: p.avatar,
-      phase: p.phase,
-      score: p.score,
-    };
-  }
-  return out;
-}
-
-function broadcastRoom(roomId, msg){
+function broadcastRoom(roomId, msg) {
   const room = rooms[roomId];
-  if(!room) return;
+  if (!room) return;
+
   const data = JSON.stringify(msg);
-  for(const p of Object.values(room.players)){
-    if(p.ws && p.ws.readyState === 1){
-      p.ws.send(data);
+
+  for (const pid of Object.keys(room.players)) {
+    const ws = connections[pid];
+    if (ws && ws.readyState === 1) {
+      ws.send(data);
     }
   }
 }
 
-wss.on("connection", (ws)=>{
-  console.log("Client connected");
+// ==== WebSocket Server ====
 
-  ws.on("message", (raw)=>{
+const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
+
+wss.on("connection", (ws) => {
+  const playerId = "p" + Math.random().toString(36).slice(2,10);
+  connections[playerId] = ws;
+
+  let currentRoom = null;
+
+  ws.send(JSON.stringify({
+    type: "welcome",
+    playerId
+  }));
+
+  ws.on("message", async (raw) => {
     let msg;
-    try{ msg = JSON.parse(raw); }catch{return;}
+    try { msg = JSON.parse(raw); } catch { return; }
 
-    // ----- Raum erstellen -----
-    if(msg.type === "createRoom"){
-      if(socketInfo.has(ws)) return;
-      const name   = (msg.name   || "Spieler").toString().slice(0,32);
-      const avatar = (msg.avatar || "🐶").toString().slice(0,8);
+    // ============= ROOM ERSTELLEN =================
+    if (msg.type === "createRoom") {
+      let code;
+      do {
+        code = makeRoomCode();
+      } while (rooms[code]);
 
-      const roomId   = generateRoomId();
-      const playerId = "p" + nextPlayerId++;
-
-      const room = {
+      rooms[code] = {
         hostId: playerId,
-        started: false,
         players: {}
       };
-      rooms[roomId] = room;
 
-      room.players[playerId] = {
+      // Spieler eintragen
+      rooms[code].players[playerId] = {
         id: playerId,
-        name,
-        avatar,
+        name: msg.name || "Spieler",
+        avatarUrl: msg.avatarUrl || null,
         phase: 1,
-        score: 0,
-        ws,
+        score: 0
       };
-      socketInfo.set(ws, {roomId, playerId});
 
-      console.log(`Room ${roomId} erstellt von ${playerId}`);
+      currentRoom = code;
 
       ws.send(JSON.stringify({
         type: "roomCreated",
-        roomId,
-        playerId,
-        hostId: room.hostId,
-        players: publicPlayers(room)
+        roomId: code,
+        hostId: playerId,
+        players: rooms[code].players
       }));
-
-      broadcastRoom(roomId, {
-        type: "players",
-        hostId: room.hostId,
-        players: publicPlayers(room)
-      });
       return;
     }
 
-    // ----- Raum beitreten -----
-    if(msg.type === "joinRoom"){
-      if(socketInfo.has(ws)) return;
-
-      const roomId = (msg.roomId || "").toString().trim();
+    // ============= ROOM BEITRETEN =================
+    if (msg.type === "joinRoom") {
+      const roomId = msg.roomId;
       const room = rooms[roomId];
-      if(!room){
-        ws.send(JSON.stringify({type:"roomError", message:"Raum nicht gefunden."}));
-        return;
-      }
-      if(room.started){
-        ws.send(JSON.stringify({type:"roomError", message:"In diesem Raum läuft bereits ein Spiel."}));
-        return;
-      }
 
-      const name   = (msg.name   || "Spieler").toString().slice(0,32);
-      const avatar = (msg.avatar || "🐶").toString().slice(0,8);
-      const playerId = "p" + nextPlayerId++;
+      if (!room) {
+        ws.send(JSON.stringify({ type: "joinError", message: "Raum nicht gefunden." }));
+        return;
+      }
 
       room.players[playerId] = {
         id: playerId,
-        name,
-        avatar,
+        name: msg.name || "Spieler",
+        avatarUrl: msg.avatarUrl || null,
         phase: 1,
-        score: 0,
-        ws,
+        score: 0
       };
-      socketInfo.set(ws,{roomId, playerId});
 
-      console.log(`Player ${playerId} joined room ${roomId}`);
+      currentRoom = roomId;
 
+      // Spieler bekommt aktuellen Zustand
       ws.send(JSON.stringify({
         type: "roomJoined",
         roomId,
-        playerId,
         hostId: room.hostId,
-        players: publicPlayers(room)
+        players: room.players
       }));
 
-      broadcastRoom(roomId,{
-        type: "players",
-        hostId: room.hostId,
-        players: publicPlayers(room)
+      // an alle broadcasten
+      broadcastRoom(roomId, {
+        type: "playersUpdated",
+        players: room.players
+      });
+
+      return;
+    }
+
+    // ============= KI AVATAR GENERIEREN =================
+    if (msg.type === "generateAvatar") {
+      if (!currentRoom) return;
+
+      const prompt = msg.prompt.trim().slice(0,400);
+
+      try {
+        const res = await openai.images.generate({
+          model: "image-mini-1.0",
+          prompt: prompt + " – round cute avatar icon, centered face portrait, 128x128",
+          size: "128x128"
+        });
+
+        const url = res.data[0].url;
+
+        rooms[currentRoom].players[playerId].avatarUrl = url;
+
+        broadcastRoom(currentRoom, {
+          type: "avatarUpdated",
+          id: playerId,
+          avatarUrl: url
+        });
+
+      } catch (e) {
+        ws.send(JSON.stringify({
+          type: "avatarError",
+          message: "Avatar konnte nicht generiert werden."
+        }));
+      }
+      return;
+    }
+
+    // ============= SPIEL STARTEN =================
+    if (msg.type === "startGame") {
+      if (!currentRoom) return;
+
+      const room = rooms[currentRoom];
+      if (playerId !== room.hostId) return;
+
+      broadcastRoom(currentRoom, { type: "gameStarted" });
+      return;
+    }
+
+    // ============= NAME ÄNDERN =================
+    if (msg.type === "setName") {
+      if (!currentRoom) return;
+      rooms[currentRoom].players[playerId].name = msg.value;
+
+      broadcastRoom(currentRoom, {
+        type: "playersUpdated",
+        players: rooms[currentRoom].players
       });
       return;
     }
 
-    // Ab hier nur, wenn Spieler in Raum
-    const info = socketInfo.get(ws);
-    if(!info) return;
-    const room = rooms[info.roomId];
-    if(!room) return;
-    const player = room.players[info.playerId];
-    if(!player) return;
+    // ============= PHASE ÄNDERN =================
+    if (msg.type === "setPhase") {
+      if (!currentRoom) return;
+      rooms[currentRoom].players[playerId].phase = msg.value;
 
-    // ----- Name ändern -----
-    if(msg.type === "setName"){
-      player.name = (msg.value || "Spieler").toString().slice(0,32);
-      broadcastRoom(info.roomId,{
-        type: "players",
-        hostId: room.hostId,
-        players: publicPlayers(room)
+      broadcastRoom(currentRoom, {
+        type: "playersUpdated",
+        players: rooms[currentRoom].players
       });
       return;
     }
 
-    // ----- Phase ändern -----
-    if(msg.type === "setPhase"){
-      const v = Number(msg.value) || 1;
-      player.phase = Math.max(1, Math.min(10, v));
-      broadcastRoom(info.roomId,{
-        type: "players",
-        hostId: room.hostId,
-        players: publicPlayers(room)
+    // ============= PHASE BEENDET =================
+    if (msg.type === "phaseDone") {
+      if (!currentRoom) return;
+      broadcastRoom(currentRoom, {
+        type: "phaseDone",
+        id: playerId,
+        name: rooms[currentRoom].players[playerId].name
       });
       return;
     }
 
-    // ----- Spiel starten (nur Host) -----
-    if(msg.type === "startGame"){
-      if(room.hostId !== info.playerId) return;
-      room.started = true;
-      broadcastRoom(info.roomId,{type:"roomStart"});
-      broadcastRoom(info.roomId,{
-        type:"players",
-        hostId:room.hostId,
-        players:publicPlayers(room)
+    // ============= SCORE EINGEREICHT =================
+    if (msg.type === "scoreSubmit") {
+      if (!currentRoom) return;
+
+      const pts = msg.points || 0;
+      rooms[currentRoom].players[playerId].score += pts;
+
+      broadcastRoom(currentRoom, {
+        type: "playersUpdated",
+        players: rooms[currentRoom].players
       });
+
       return;
     }
 
-    // ----- Phase beendet -----
-    if(msg.type === "phaseDone"){
-      broadcastRoom(info.roomId,{
-        type: "roundStart",
-        finisher: info.playerId,
-        name: player.name,
-      });
-      return;
-    }
+    // ============= CHAT =================
+    if (msg.type === "chat") {
+      if (!currentRoom) return;
 
-    // ----- Punkte abgeben -----
-    if(msg.type === "scoreSubmit"){
-      const pts = Number(msg.points)||0;
-      player.score += pts;
-      broadcastRoom(info.roomId,{
-        type:"scoreUpdate",
-        id:info.playerId,
-        points:pts,
-        total:player.score
-      });
-      broadcastRoom(info.roomId,{
-        type:"players",
-        hostId:room.hostId,
-        players:publicPlayers(room)
-      });
-      return;
-    }
-
-    // ----- Chat -----
-    if(msg.type === "chat"){
-      const text = (msg.text || "").toString().slice(0,300);
-      if(!text) return;
-      broadcastRoom(info.roomId,{
-        type:"chat",
-        id:info.playerId,
-        text
+      broadcastRoom(currentRoom, {
+        type: "chat",
+        id: playerId,
+        text: msg.text,
+        name: rooms[currentRoom].players[playerId].name
       });
       return;
     }
   });
 
-  ws.on("close", ()=>{
-    const info = socketInfo.get(ws);
-    if(!info) return;
+  ws.on("close", () => {
+    delete connections[playerId];
 
-    const {roomId, playerId} = info;
-    socketInfo.delete(ws);
-    const room = rooms[roomId];
-    if(!room) return;
+    if (currentRoom && rooms[currentRoom]) {
+      delete rooms[currentRoom].players[playerId];
 
-    delete room.players[playerId];
-    console.log(`Player ${playerId} left room ${roomId}`);
+      broadcastRoom(currentRoom, {
+        type: "playersUpdated",
+        players: rooms[currentRoom].players
+      });
 
-    const remaining = Object.keys(room.players).length;
-    if(remaining===0){
-      delete rooms[roomId];
-      console.log(`Room ${roomId} deleted (leer).`);
-      return;
+      // Raum löschen wenn leer
+      if (Object.keys(rooms[currentRoom].players).length === 0) {
+        delete rooms[currentRoom];
+      }
     }
-
-    if(room.hostId === playerId){
-      room.hostId = Object.keys(room.players)[0];
-      console.log(`Room ${roomId}: Host gewechselt zu ${room.hostId}`);
-    }
-
-    broadcastRoom(roomId,{
-      type:"players",
-      hostId:room.hostId,
-      players:publicPlayers(room)
-    });
   });
 });
 
-console.log("Ready.");
+console.log("Server läuft…");
